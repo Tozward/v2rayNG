@@ -39,7 +39,10 @@ class V2RayVpnService : VpnService(), ServiceControl {
         private const val PRIVATE_VLAN4_ROUTER = "10.10.10.2"
         private const val PRIVATE_VLAN6_CLIENT = "fc00::10:10:10:1"
         private const val PRIVATE_VLAN6_ROUTER = "fc00::10:10:10:2"
-        private const val TUN2SOCKS = "libtun2socks.so"
+
+        init {
+            System.loadLibrary("hev-socks5-tunnel")
+        }
     }
 
 
@@ -48,6 +51,10 @@ class V2RayVpnService : VpnService(), ServiceControl {
 
     //val fd: Int get() = mInterface.fd
     private lateinit var process: Process
+
+    private external fun TProxyStartService(configPath: String, fd: Int)
+    private external fun TProxyStopService()
+    private external fun TProxyGetStats(): LongArray
 
     /**destroy
      * Unfortunately registerDefaultNetworkCallback is going to return our VPN interface: https://android.googlesource.com/platform/frameworks/base/+/dda156ab0c5d66ad82bdcf76cda07cbc0a9c8a2e
@@ -209,50 +216,19 @@ class V2RayVpnService : VpnService(), ServiceControl {
     }
 
     private fun runTun2socks() {
-        val socksPort = SettingsManager.getSocksPort()
-        val cmd = arrayListOf(
-            File(applicationContext.applicationInfo.nativeLibraryDir, TUN2SOCKS).absolutePath,
-            "--netif-ipaddr", PRIVATE_VLAN4_ROUTER,
-            "--netif-netmask", "255.255.255.252",
-            "--socks-server-addr", "$LOOPBACK:${socksPort}",
-            "--tunmtu", VPN_MTU.toString(),
-            "--sock-path", "sock_path",//File(applicationContext.filesDir, "sock_path").absolutePath,
-            "--enable-udprelay",
-            "--loglevel", "notice"
-        )
+        val tproxyFile = File(applicationContext.cacheDir, "tproxy.conf")
+        tproxyFile.writeText("""
+            misc:
+              task-stack-size: 128
+            tunnel:
+              mtu: $VPN_MTU
+            socks5:
+              port: 10808
+              address: '127.0.0.1'
+              udp: 'udp'
+        """.trimIndent())
 
-        if (MmkvManager.decodeSettingsBool(AppConfig.PREF_PREFER_IPV6)) {
-            cmd.add("--netif-ip6addr")
-            cmd.add(PRIVATE_VLAN6_ROUTER)
-        }
-        if (MmkvManager.decodeSettingsBool(AppConfig.PREF_LOCAL_DNS_ENABLED)) {
-            val localDnsPort = Utils.parseInt(MmkvManager.decodeSettingsString(AppConfig.PREF_LOCAL_DNS_PORT), AppConfig.PORT_LOCAL_DNS.toInt())
-            cmd.add("--dnsgw")
-            cmd.add("$LOOPBACK:${localDnsPort}")
-        }
-        Log.d(packageName, cmd.toString())
-
-        try {
-            val proBuilder = ProcessBuilder(cmd)
-            proBuilder.redirectErrorStream(true)
-            process = proBuilder
-                .directory(applicationContext.filesDir)
-                .start()
-            Thread {
-                Log.d(packageName, "$TUN2SOCKS check")
-                process.waitFor()
-                Log.d(packageName, "$TUN2SOCKS exited")
-                if (isRunning) {
-                    Log.d(packageName, "$TUN2SOCKS restart")
-                    runTun2socks()
-                }
-            }.start()
-            Log.d(packageName, process.toString())
-
-            sendFd()
-        } catch (e: Exception) {
-            Log.d(packageName, e.toString())
-        }
+        TProxyStartService(tproxyFile.absolutePath, mInterface.fd)
     }
 
     private fun sendFd() {
@@ -300,7 +276,7 @@ class V2RayVpnService : VpnService(), ServiceControl {
         }
 
         try {
-            Log.d(packageName, "tun2socks destroy")
+            TProxyStopService()
             process.destroy()
         } catch (e: Exception) {
             Log.d(packageName, e.toString())
